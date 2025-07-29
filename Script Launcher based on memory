@@ -1,0 +1,120 @@
+/** @param {NS} ns */
+import { scanAllServers } from '/bitburner-helpers-syntax-fix.js'; // Import from your helper file
+
+export async function main(ns) {
+    ns.disableLog('ALL'); // Disable all logs to keep the console clean
+    ns.enableLog('exec'); // Re-enable exec logs to see launched scripts
+
+    // --- Configuration ---
+    // Define the scripts you want to launch and their targets.
+    // You can add more entries to this array.
+    // Scripts will be launched in the order they appear here.
+    const scriptsToLaunch = [
+        { name: 'zer0.js',target: 'home', minRam: 1.5 }, // Example scripts
+        { name: 'neo-net.js', target:'home', minRam: 1.5 },
+        { name: 'the-hub.js', target:'home', minRam: 1.5},
+        { name: 'rothman-uni.js',target:'home', minRam: 1.5 },
+        { name: 'summit-uni.js', target:'home', minRam: 1.5},
+        { name: 'netlink.js', target:'home', minRam: 1.5},
+        { name: 'zb-institute.js',target:'home', minRam: 1.5},
+        { name: 'catalyst.js',target:'home', minRam: 1.5},
+        { name: 'aevum-police.js',target:'home', minRam: 1.5},
+        //scriptName, host.hostname, threadsPossible, scriptTarget
+        // Add more scripts and targets as needed
+    ];
+
+    const sleepTime = 2000; // How long to wait between scanning and launching attempts (in milliseconds)
+    const maxMemoryUtilization = 0.15; // Only launch scripts if memory utilization is below this percentage
+    const fixedThreadCount = 6; // NEW: Set the desired fixed number of threads
+
+    // --- Main Logic ---
+    while (true) {
+        ns.print('INFO: Scanning network for available RAM...');
+        const allServers = scanAllServers(ns); // Use the imported helper function
+
+        const availableHosts = [];
+        for (const server of allServers) {
+            // Only consider servers we have root access to and that are not 'home'
+            // We usually want to avoid maxing out 'home' with helper scripts
+            if (ns.hasRootAccess(server) && server !== 'home') {
+                const maxRam = ns.getServerMaxRam(server);
+                const usedRam = ns.getServerUsedRam(server);
+                const availableRam = maxRam - usedRam;
+
+                // Only consider hosts where current memory utilization is less than maxMemoryUtilization
+                // And ensure there's at least some RAM available to prevent division by zero or trivial cases
+                if (maxRam > 0 && (usedRam / maxRam) < maxMemoryUtilization) {
+                    availableHosts.push({
+                        hostname: server,
+                        availableRam: availableRam // Still store available RAM for initial check
+                    });
+                }
+            }
+        }
+
+        // Sort available hosts by available RAM (ascending) to fill smaller servers first
+        // Or descending if you prefer to fill largest servers first
+        availableHosts.sort((a, b) => a.availableRam - b.availableRam);
+
+        ns.print(`INFO: Found ${availableHosts.length} servers with available RAM under ${maxMemoryUtilization * 100}% utilization.`);
+
+        for (const scriptConfig of scriptsToLaunch) {
+            const scriptName = scriptConfig.name;
+            const scriptTarget = scriptConfig.target;
+
+            // Ensure the script exists and we know its RAM cost
+            let scriptRam = 0;
+            try {
+                scriptRam = ns.getScriptRam(scriptName, 'home'); // Check RAM from home, assuming script exists there
+            } catch (e) {
+                ns.print(`WARN: Script '${scriptName}' not found or inaccessible. Skipping. Error: ${e.message}`);
+                continue; // Skip this script if its RAM cannot be determined
+            }
+
+            if (scriptRam === 0) {
+                ns.print(`WARN: Script '${scriptName}' has 0 RAM cost. Skipping to avoid infinite loops if unintended.`);
+                continue;
+            }
+
+            for (const host of availableHosts) {
+                // Recalculate threads based on the *current* available RAM for this host
+                // This accounts for RAM used by scripts launched in the same loop iteration
+                const currentMaxRam = ns.getServerMaxRam(host.hostname);
+                const currentUsedRam = ns.getServerUsedRam(host.hostname);
+                const currentAvailableRam = currentMaxRam - currentUsedRam;
+                
+                // Calculate required RAM for the fixed number of threads
+                const requiredRam = scriptRam * fixedThreadCount;
+
+                // Only attempt to launch if the host is still below the utilization threshold
+                // AND has enough RAM for the fixed number of threads
+                if ((currentUsedRam / currentMaxRam) < maxMemoryUtilization && currentAvailableRam >= requiredRam) {
+                    const threadsToUse = fixedThreadCount; // Use the fixed thread count
+
+                    ns.print(`INFO: Attempting to launch ${scriptName} on ${host.hostname} with ${threadsToUse} threads targeting ${scriptTarget}`);
+
+                    // Copy the script to the host if it's not already there (prevents errors)
+                    if (!ns.fileExists(scriptName, host.hostname)) {
+                        ns.scp(scriptName, host.hostname, 'home');
+                        ns.print(`INFO: Copied ${scriptName} to ${host.hostname}.`);
+                    }
+
+                    // Use spread operator to ensure arguments for the child script are always passed correctly
+                    const pid = ns.exec(scriptName, host.hostname, threadsToUse, ...[scriptTarget]); 
+                    if (pid === 0) {
+                        ns.print(`ERROR: Failed to launch ${scriptName} on ${host.hostname}. (Perhaps not enough RAM still, or other issues).`);
+                    } else {
+                        ns.print(`SUCCESS: Launched ${scriptName} on ${host.hostname} (PID: ${pid}) with ${threadsToUse} threads.`);
+                        // Check if the host is now at or above the utilization threshold after launching
+                        if (((currentUsedRam + requiredRam) / currentMaxRam) >= maxMemoryUtilization) {
+                            ns.print(`INFO: Host ${host.hostname} is now at or above ${maxMemoryUtilization * 100}% utilization.`);
+                        }
+                    }
+                }
+            }
+        }
+
+        ns.print(`INFO: Finished launching attempts. Sleeping for ${ns.tFormat(sleepTime, true)}...`);
+        await ns.sleep(sleepTime);
+    }
+}
